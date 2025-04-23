@@ -22,22 +22,18 @@ def process_videos(video_dir, action_type="fast"):
             keypoints_json = os.path.join(output_dir, f"bowling_analysis_{video_id}.json")
             pitch_json = os.path.join(output_dir, f"pitch_reference_{video_id}.json")
             logging.info(f"Processing {video_id} with utils.keypoints_utils2")
-            # Generate 3D keypoints with pitch correction
             keypoints = extract_keypoints(
                 video_path,
                 keypoints_json,
                 pitch_json if os.path.exists(pitch_json) else None,
                 config={"min_detection_confidence": 0.6, "min_tracking_confidence": 0.6}
             )
-            # Validate 3D keypoints
             if keypoints and any("z" in lm for frame in keypoints for lm in frame.get("keypoints", {}).values()):
                 logging.info("Confirmed 3D keypoints with z-coordinates")
             else:
                 logging.warning("No z-coordinates detected in keypoints")
-            # Generate pitch reference if not exists
             if not os.path.exists(pitch_json):
                 extract_pitch_reference(video_path, keypoints_json, pitch_json, action_type)
-                # Reprocess keypoints with new pitch correction
                 if os.path.exists(pitch_json):
                     keypoints = extract_keypoints(
                         video_path,

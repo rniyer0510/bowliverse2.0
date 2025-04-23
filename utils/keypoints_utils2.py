@@ -21,7 +21,6 @@ def extract_keypoints(video_path, output_json, pitch_json=None, config=None):
     Returns:
         List of keypoint frames with 3D coordinates.
     """
-    # Check MediaPipe version
     import mediapipe
     mp_version = mediapipe.__version__
     logging.info(f"Using MediaPipe version {mp_version}")
@@ -32,7 +31,6 @@ def extract_keypoints(video_path, output_json, pitch_json=None, config=None):
     min_detection_confidence = config.get("min_detection_confidence", 0.6)
     min_tracking_confidence = config.get("min_tracking_confidence", 0.6)
     
-    # Initialize MediaPipe Pose for 3D output
     pose = mp_pose.Pose(
         static_image_mode=False,
         model_complexity=2,
@@ -41,7 +39,6 @@ def extract_keypoints(video_path, output_json, pitch_json=None, config=None):
         smooth_landmarks=True
     )
     
-    # Open video with OpenCV
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logging.error(f"Cannot open video {video_path}")
@@ -102,10 +99,10 @@ def extract_keypoints(video_path, output_json, pitch_json=None, config=None):
 
 def adjust_keypoints(keypoints, pitch_angle, config=None):
     """
-    Rotate 3D keypoints by pitch_angle (degrees, converted to radians).
+    Rotate 3D keypoints around the X-axis (Y-Z plane) by pitch_angle to correct for camera tilt.
     Args:
         keypoints: Dict of keypoints with x, y, z, visibility.
-        pitch_angle: Angle in degrees.
+        pitch_angle: Angle in degrees (Y-Z plane, vertical tilt).
         config: Configuration parameters.
     Returns:
         Adjusted keypoints dict.
@@ -123,9 +120,10 @@ def adjust_keypoints(keypoints, pitch_angle, config=None):
         x, y, z = lm_data.get("x", 0), lm_data.get("y", 0), lm_data.get("z", 0)
         visibility = lm_data.get("visibility", 0)
         
-        x_new = x * cos_theta + y * sin_theta
-        y_new = -x * sin_theta + y * cos_theta
-        z_new = z
+        # Rotate around X-axis (Y-Z plane)
+        y_new = y * cos_theta - z * sin_theta
+        z_new = y * sin_theta + z * cos_theta
+        x_new = x  # Unchanged
         
         adjusted[lm_key] = {
             "x": float(x_new),
