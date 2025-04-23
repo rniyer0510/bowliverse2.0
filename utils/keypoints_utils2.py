@@ -4,6 +4,7 @@ import json
 import numpy as np
 import logging
 import os
+from packaging import version
 
 mp_pose = mp.solutions.pose
 
@@ -22,9 +23,10 @@ def extract_keypoints(video_path, output_json, pitch_json=None, config=None):
     """
     # Check MediaPipe version
     import mediapipe
-    if mediapipe.__version__ < '0.8.9':
-        logging.error("MediaPipe version >= 0.8.9 required for 3D pose estimation")
-        return []
+    mp_version = mediapipe.__version__
+    logging.info(f"Using MediaPipe version {mp_version}")
+    if version.parse(mp_version) < version.parse('0.8.9'):
+        logging.warning(f"MediaPipe version {mp_version} detected; >= 0.8.9 recommended for reliable 3D pose estimation")
 
     config = config or {}
     min_detection_confidence = config.get("min_detection_confidence", 0.6)

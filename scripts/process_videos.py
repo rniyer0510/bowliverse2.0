@@ -21,7 +21,7 @@ def process_videos(video_dir, action_type="fast"):
             video_path = os.path.join(video_dir, filename)
             keypoints_json = os.path.join(output_dir, f"bowling_analysis_{video_id}.json")
             pitch_json = os.path.join(output_dir, f"pitch_reference_{video_id}.json")
-            logging.info(f"Processing {video_id}")
+            logging.info(f"Processing {video_id} with utils.keypoints_utils2")
             # Generate 3D keypoints with pitch correction
             keypoints = extract_keypoints(
                 video_path,
