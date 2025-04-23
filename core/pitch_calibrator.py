@@ -3,8 +3,22 @@ import numpy as np
 import json
 import logging
 import os
+import math
 
 logging.basicConfig(level=logging.INFO)
+
+def estimate_pitch_angle(hip_y, foot_y, hip_z, foot_z):
+    """
+    Estimate pitch angle from hip to foot in the y-z plane.
+    Args:
+        hip_y, foot_y: Vertical coordinates (image space, y increases downward).
+        hip_z, foot_z: Depth coordinates (relative to hip center).
+    Returns:
+        Pitch angle in degrees.
+    """
+    dy = hip_y - foot_y
+    dz = hip_z - foot_z
+    return math.degrees(math.atan2(dy, dz))
 
 def extract_pitch_reference(video_path, keypoints_json, output_json, action_type):
     """
@@ -50,8 +64,8 @@ def extract_pitch_reference(video_path, keypoints_json, output_json, action_type
                 # Compute average foot position (landmarks 27 and 28)
                 foot_avg_y = (kp["landmark_27"]["y"] + kp["landmark_28"]["y"]) / 2
                 foot_avg_z = (kp["landmark_27"]["z"] + kp["landmark_28"]["z"]) / 2
-                # Calculate pitch angle in y-z plane
-                pitch_angle = np.degrees(np.arctan2(hip_avg_y - foot_avg_y, hip_avg_z - foot_avg_z)) % 360
+                # Estimate pitch angle
+                pitch_angle = estimate_pitch_angle(hip_avg_y, foot_avg_y, hip_avg_z, foot_avg_z)
                 pitch_angles.append(pitch_angle)
         
         frame_count += 1
@@ -69,7 +83,7 @@ def extract_pitch_reference(video_path, keypoints_json, output_json, action_type
     # Preserve existing JSON structure
     output_data = {
         "crease_front": {
-            "left": {"x": 0.26944444444444443, "y": 0.4375},  # From provided pitch_reference_cZ-JgPETblw.json
+            "left": {"x": 0.26944444444444443, "y": 0.4375},
             "right": {"x": 0.49722222222222223, "y": 0.4375}
         },
         "pitch_angle": pitch_angle,
