@@ -1,0 +1,206 @@
+import os
+import json
+import logging
+import pickle
+import numpy as np
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from models.frame_detector import FrameDetector
+from models.angle_adjuster import AngleAdjuster
+from models.stride_predictor import StridePredictor
+from models.biomechanics_refiner import BiomechanicsRefiner
+from core.db_utils import bootstrap_assessments
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def calculate_angle(p1, p2, p3, pitch_angle=0):
+    v1 = np.array([p1["x"] - p2["x"], p1["y"] - p2["y"]])
+    v2 = np.array([p3["x"] - p2["x"], p3["y"] - p2["y"]])
+    dot_product = np.dot(v1, v2)
+    norms = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if norms == 0:
+        return 0.0
+    angle = np.degrees(np.arccos(np.clip(dot_product / norms, -1.0, 1.0)))
+    return angle - pitch_angle if angle > pitch_angle else angle
+
+def prepare_frame_data(keypoints_dir, assessments, action_type):
+    X_frame, y_frame = [], []
+    for video_id, labels in assessments.items():
+        logging.info(f"Processing video: {video_id}")
+        full_keypoints_path = os.path.join(keypoints_dir, f"bowling_analysis_{video_id}.json")
+        pitch_json = os.path.join(keypoints_dir, f"pitch_reference_{action_type}_{video_id}.json")
+        if not os.path.exists(full_keypoints_path) or not os.path.exists(pitch_json):
+            logging.warning(f"Missing files for {video_id}")
+            continue
+        with open(full_keypoints_path, 'r') as f:
+            full_keypoints = json.load(f)
+        with open(pitch_json, 'r') as f:
+            pitch_data = json.load(f)
+        pitch_angle = pitch_data["pitch_angle"]
+        crease_x = (pitch_data["crease_front"]["left"]["x"] + pitch_data["crease_front"]["right"]["x"]) / 2
+        max_y = max([kp["keypoints"].get("landmark_11", {"y": 1})["y"] for kp in full_keypoints])
+        frame_keys = ["bfc_frame", "ffc_frame", "uah_frame", "release_frame"]
+        for i, key in enumerate(frame_keys, 1):
+            frame_idx = min(labels.get(key, -1), len(full_keypoints)-1) if labels.get(key, -1) >= 0 else -1
+            if frame_idx == -1 or "keypoints" not in full_keypoints[frame_idx]:
+                logging.warning(f"Invalid {key} frame {frame_idx} for {video_id} (max {len(full_keypoints)-1})")
+                continue
+            kp = full_keypoints[frame_idx]["keypoints"]
+            kp_prev2 = full_keypoints[max(0, frame_idx-2)]["keypoints"]
+            kp_prev1 = full_keypoints[max(0, frame_idx-1)]["keypoints"]
+            kp_next1 = full_keypoints[min(len(full_keypoints)-1, frame_idx+1)]["keypoints"]
+            kp_next2 = full_keypoints[min(len(full_keypoints)-1, frame_idx+2)]["keypoints"]
+            elbow_angle = calculate_angle(kp.get("landmark_11", {"x": 0, "y": 0}),
+                                        kp.get("landmark_13", {"x": 0, "y": 0}),
+                                        kp.get("landmark_15", {"x": 0, "y": 0}), pitch_angle)
+            elbow_angle_prev2 = calculate_angle(kp_prev2.get("landmark_11", {"x": 0, "y": 0}),
+                                              kp_prev2.get("landmark_13", {"x": 0, "y": 0}),
+                                              kp_prev2.get("landmark_15", {"x": 0, "y": 0}), pitch_angle)
+            elbow_angle_next2 = calculate_angle(kp_next2.get("landmark_11", {"x": 0, "y": 0}),
+                                              kp_next2.get("landmark_13", {"x": 0, "y": 0}),
+                                              kp_next2.get("landmark_15", {"x": 0, "y": 0}), pitch_angle)
+            wrist_dx = (kp_next2.get("landmark_15", {"x": 0})["x"] - kp_prev2.get("landmark_15", {"x": 0})["x"]) / 4
+            features = [
+                abs(kp.get("landmark_27", {"y": 0})["y"] - kp_prev1.get("landmark_27", {"y": 0})["y"]) / max_y,
+                abs(kp.get("landmark_28", {"y": 0})["y"] - kp_prev1.get("landmark_28", {"y": 0})["y"]) / max_y,
+                (kp_next2.get("landmark_13", {"y": 0})["y"] - kp_prev2.get("landmark_13", {"y": 0})["y"]) / (4 * max_y),
+                wrist_dx,
+                (kp_next2.get("landmark_11", {"y": 0})["y"] - kp_prev2.get("landmark_11", {"y": 0})["y"]) / (4 * max_y),
+                abs(kp.get("landmark_11", {"y": 0})["y"] - kp.get("landmark_13", {"y": 0})["y"]) / max_y,
+                (elbow_angle_next2 - elbow_angle_prev2) / 4,
+                elbow_angle,
+                abs(kp.get("landmark_27", {"x": 0})["x"] - crease_x) / max_y  # Crease proximity
+            ]
+            X_frame.append(features)
+            y_frame.append(i)
+    return np.array(X_frame), np.array(y_frame)
+
+def prepare_angle_data(keypoints_dir, assessments, action_type):
+    X_angle, y_pitch = [], []
+    for video_id, labels in assessments.items():
+        full_keypoints_path = os.path.join(keypoints_dir, f"bowling_analysis_{video_id}.json")
+        pitch_json = os.path.join(keypoints_dir, f"pitch_reference_{action_type}_{video_id}.json")
+        if not os.path.exists(full_keypoints_path) or not os.path.exists(pitch_json):
+            continue
+        with open(full_keypoints_path, 'r') as f:
+            full_keypoints = json.load(f)
+        with open(pitch_json, 'r') as f:
+            pitch_data = json.load(f)
+        pitch_angle = pitch_data["pitch_angle"]
+        for key in ["uah_frame", "release_frame"]:
+            frame_idx = min(labels.get(key, -1), len(full_keypoints)-1) if labels.get(key, -1) >= 0 else -1
+            if frame_idx == -1 or "keypoints" not in full_keypoints[frame_idx]:
+                continue
+            kp = full_keypoints[frame_idx]["keypoints"]
+            features = [kp.get(f"landmark_{j}", {"x": 0, "y": 0})[k] for j in range(33) for k in ["x", "y"]]
+            X_angle.append(features[:66])
+            y_pitch.append(labels.get(f"{key.split('_')[0]}_angle", 0.0))
+    return np.array(X_angle), np.array(y_pitch)
+
+def prepare_stride_data(keypoints_dir, assessments, action_type):
+    X_stride, y_stride = [], []
+    for video_id, labels in assessments.items():
+        full_keypoints_path = os.path.join(keypoints_dir, f"bowling_analysis_{video_id}.json")
+        pitch_json = os.path.join(keypoints_dir, f"pitch_reference_{action_type}_{video_id}.json")
+        if not os.path.exists(full_keypoints_path) or not os.path.exists(pitch_json):
+            continue
+        with open(full_keypoints_path, 'r') as f:
+            full_keypoints = json.load(f)
+        with open(pitch_json, 'r') as f:
+            pitch_data = json.load(f)
+        bfc_idx = min(labels.get("bfc_frame", -1), len(full_keypoints)-1) if labels.get("bfc_frame", -1) >= 0 else -1
+        ffc_idx = min(labels.get("ffc_frame", -1), len(full_keypoints)-1) if labels.get("ffc_frame", -1) >= 0 else -1
+        if bfc_idx == -1 or ffc_idx == -1:
+            continue
+        bfc_kp = full_keypoints[bfc_idx]["keypoints"]
+        ffc_kp = full_keypoints[ffc_idx]["keypoints"]
+        features = ([bfc_kp.get(f"landmark_{i}", {"x": 0, "y": 0})[k] for i in range(33) for k in ["x", "y"]] + 
+                   [ffc_kp.get(f"landmark_{i}", {"x": 0, "y": 0})[k] for i in range(33) for k in ["x", "y"]])
+        X_stride.append(features[:132])
+        y_stride.append(labels.get("stride_length", 0.0))
+    return np.array(X_stride), np.array(y_stride)
+
+def prepare_alignment_data(keypoints_dir, assessments, action_type):
+    X_align, y_align = [], []
+    style_map = {"Front-on": 0, "Side-on": 1, "Mixed": 2}
+    for video_id, labels in assessments.items():
+        full_keypoints_path = os.path.join(keypoints_dir, f"bowling_analysis_{video_id}.json")
+        pitch_json = os.path.join(keypoints_dir, f"pitch_reference_{action_type}_{video_id}.json")
+        if not os.path.exists(full_keypoints_path) or not os.path.exists(pitch_json):
+            continue
+        with open(full_keypoints_path, 'r') as f:
+            full_keypoints = json.load(f)
+        with open(pitch_json, 'r') as f:
+            pitch_data = json.load(f)
+        pitch_angle = pitch_data["pitch_angle"]
+        max_y = max([kp["keypoints"].get("landmark_11", {"y": 1})["y"] for kp in full_keypoints])
+        bfc_idx = min(labels.get("bfc_frame", -1), len(full_keypoints)-1) if labels.get("bfc_frame", -1) >= 0 else -1
+        ffc_idx = min(labels.get("ffc_frame", -1), len(full_keypoints)-1) if labels.get("ffc_frame", -1) >= 0 else -1
+        if bfc_idx == -1 or ffc_idx == -1 or "keypoints" not in full_keypoints[bfc_idx] or "keypoints" not in full_keypoints[ffc_idx]:
+            continue
+        bfc_kp = full_keypoints[bfc_idx]["keypoints"]
+        ffc_kp = full_keypoints[ffc_idx]["keypoints"]
+        shoulder_angle = calculate_angle(ffc_kp.get("landmark_11", {"x": 0, "y": 0}),
+                                       ffc_kp.get("landmark_12", {"x": 0, "y": 0}),
+                                       {"x": (ffc_kp.get("landmark_23", {"x": 0})["x"] + ffc_kp.get("landmark_24", {"x": 0})["x"]) / 2,
+                                        "y": (ffc_kp.get("landmark_23", {"y": 0})["y"] + ffc_kp.get("landmark_24", {"y": 0})["y"]) / 2},
+                                       pitch_angle)
+        features = [
+            (bfc_kp.get("landmark_27", {"x": 0})["x"] - bfc_kp.get("landmark_28", {"x": 0})["x"]) / max_y,
+            (ffc_kp.get("landmark_27", {"x": 0})["x"] - ffc_kp.get("landmark_28", {"x": 0})["x"]) / max_y,
+            shoulder_angle,
+            abs(ffc_kp.get("landmark_11", {"x": 0})["x"] - ffc_kp.get("landmark_12", {"x": 0})["x"]) / max_y
+        ]
+        X_align.append(features)
+        y_align.append(style_map.get(labels.get("alignment", "Mixed"), 2))
+    return np.array(X_align), np.array(y_align)
+
+def train_models(keypoints_dir, output_dir, db_path, action_type="fast"):
+    os.makedirs(output_dir, exist_ok=True)
+    assessments = bootstrap_assessments(db_path)
+    
+    X_frame, y_frame = prepare_frame_data(keypoints_dir, assessments, action_type)
+    if X_frame.size > 0:
+        frame_detector = FrameDetector(action_type)
+        frame_detector.model.fit(X_frame, y_frame)
+        frame_detector.trained = True
+        with open(os.path.join(output_dir, f"frame_detector_{action_type}.pkl"), 'wb') as f:
+            pickle.dump(frame_detector, f)
+        logging.info(f"Trained FrameDetector with {len(X_frame)} samples")
+    
+    X_angle, y_pitch = prepare_angle_data(keypoints_dir, assessments, action_type)
+    if X_angle.size > 0:
+        angle_adjuster = AngleAdjuster("elbow")
+        angle_adjuster.model.fit(X_angle, y_pitch)
+        angle_adjuster.trained = True
+        with open(os.path.join(output_dir, f"angle_adjuster_elbow_{action_type}.pkl"), 'wb') as f:
+            pickle.dump(angle_adjuster, f)
+        logging.info(f"Trained AngleAdjuster with {len(X_angle)} samples")
+    
+    X_stride, y_stride = prepare_stride_data(keypoints_dir, assessments, action_type)
+    if X_stride.size > 0:
+        stride_predictor = StridePredictor(action_type)
+        stride_predictor.model.fit(X_stride, y_stride)
+        stride_predictor.trained = True
+        with open(os.path.join(output_dir, f"stride_predictor_{action_type}.pkl"), 'wb') as f:
+            pickle.dump(stride_predictor, f)
+        logging.info(f"Trained StridePredictor with {len(X_stride)} samples")
+    
+    X_align, y_align = prepare_alignment_data(keypoints_dir, assessments, action_type)
+    if X_align.size > 0:
+        refiner = BiomechanicsRefiner(action_type)
+        refiner.model.fit(X_align, y_align)
+        refiner.trained = True
+        with open(os.path.join(output_dir, f"biomechanics_refiner_{action_type}.pkl"), 'wb') as f:
+            pickle.dump(refiner, f)
+        logging.info(f"Trained BiomechanicsRefiner with {len(X_align)} samples")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: python train_models.py <keypoints_dir> <output_dir> <db_path> [action_type]")
+        sys.exit(1)
+    keypoints_dir = sys.argv[1]
+    output_dir = sys.argv[2]
+    db_path = sys.argv[3]
+    action_type = sys.argv[4] if len(sys.argv) > 4 else "fast"
+    train_models(keypoints_dir, output_dir, db_path, action_type)

@@ -1,0 +1,10 @@
+scipy
+hmmlearn
+mediapipe
+scikit-learn
+numpy
+opencv-python
+yt-dlp
+requests
+
+

@@ -1,0 +1,14 @@
+Python
+pycache/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+Output
+output/
+*.pkl
+*.db
+Videos
+videos/*.mp4

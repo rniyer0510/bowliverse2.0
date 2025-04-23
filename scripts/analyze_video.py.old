@@ -1,0 +1,168 @@
+import numpy as np
+import os
+import sys
+import json
+import logging
+import pickle
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from models.frame_detector import FrameDetector
+from models.angle_adjuster import AngleAdjuster
+from models.stride_predictor import StridePredictor
+from models.biomechanics_refiner import BiomechanicsRefiner
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_model(model_path):
+    if os.path.exists(model_path):
+        with open(model_path, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+def calculate_angle(p1, p2, p3, pitch_angle=0):
+    v1 = np.array([p1["x"] - p2["x"], p1["y"] - p2["y"]])
+    v2 = np.array([p3["x"] - p2["x"], p3["y"] - p2["y"]])
+    dot_product = np.dot(v1, v2)
+    norms = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if norms == 0:
+        return 0.0
+    angle = np.degrees(np.arccos(np.clip(dot_product / norms, -1.0, 1.0)))
+    return angle - pitch_angle if angle > pitch_angle else angle
+
+def analyze_video(video_path, keypoints_dir, output_dir, action_type="fast"):
+    video_id = os.path.splitext(os.path.basename(video_path))[0].replace(f"{action_type}_", "")
+    full_keypoints_path = os.path.join(keypoints_dir, f"bowling_analysis_{video_id}.json")
+    pitch_json = os.path.join(keypoints_dir, f"pitch_reference_{action_type}_{video_id}.json")
+    
+    if not os.path.exists(full_keypoints_path) or not os.path.exists(pitch_json):
+        logging.error(f"Missing files for {video_id}")
+        return
+    
+    with open(full_keypoints_path, 'r') as f:
+        full_keypoints = json.load(f)
+    with open(pitch_json, 'r') as f:
+        pitch_data = json.load(f)
+    pitch_angle = pitch_data["pitch_angle"]
+    crease_x = (pitch_data["crease_front"]["left"]["x"] + pitch_data["crease_front"]["right"]["x"]) / 2
+    
+    frame_detector = load_model(os.path.join(output_dir, f"frame_detector_{action_type}.pkl"))
+    angle_adjuster = load_model(os.path.join(output_dir, f"angle_adjuster_elbow_{action_type}.pkl"))
+    stride_predictor = load_model(os.path.join(output_dir, f"stride_predictor_{action_type}.pkl"))
+    refiner = load_model(os.path.join(output_dir, f"biomechanics_refiner_{action_type}.pkl"))
+    
+    assessment = {"video_id": video_id, "pitch_angle": pitch_angle}
+    
+    if frame_detector and frame_detector.trained:
+        X_frame = []
+        max_y = max([kp["keypoints"].get("landmark_11", {"y": 1})["y"] for kp in full_keypoints])
+        wrist_x = [kp["keypoints"].get("landmark_15", {"x": 0})["x"] for kp in full_keypoints]
+        elbow_angles = [calculate_angle(kp["keypoints"].get("landmark_11", {"x": 0, "y": 0}),
+                                       kp["keypoints"].get("landmark_13", {"x": 0, "y": 0}),
+                                       kp["keypoints"].get("landmark_15", {"x": 0, "y": 0}), pitch_angle) 
+                        for kp in full_keypoints]
+        for i, frame in enumerate(full_keypoints):
+            kp = frame["keypoints"]
+            kp_prev2 = full_keypoints[max(0, i-2)]["keypoints"]
+            kp_prev1 = full_keypoints[max(0, i-1)]["keypoints"]
+            kp_next1 = full_keypoints[min(len(full_keypoints)-1, i+1)]["keypoints"]
+            kp_next2 = full_keypoints[min(len(full_keypoints)-1, i+2)]["keypoints"]
+            elbow_angle = elbow_angles[i]
+            elbow_angle_prev2 = calculate_angle(kp_prev2.get("landmark_11", {"x": 0, "y": 0}),
+                                              kp_prev2.get("landmark_13", {"x": 0, "y": 0}),
+                                              kp_prev2.get("landmark_15", {"x": 0, "y": 0}), pitch_angle)
+            elbow_angle_next2 = calculate_angle(kp_next2.get("landmark_11", {"x": 0, "y": 0}),
+                                              kp_next2.get("landmark_13", {"x": 0, "y": 0}),
+                                              kp_next2.get("landmark_15", {"x": 0, "y": 0}), pitch_angle)
+            wrist_dx = (kp_next2.get("landmark_15", {"x": 0})["x"] - kp_prev2.get("landmark_15", {"x": 0})["x"]) / 4
+            features = [
+                abs(kp.get("landmark_27", {"y": 0})["y"] - kp_prev1.get("landmark_27", {"y": 0})["y"]) / max_y,
+                abs(kp.get("landmark_28", {"y": 0})["y"] - kp_prev1.get("landmark_28", {"y": 0})["y"]) / max_y,
+                (kp_next2.get("landmark_13", {"y": 0})["y"] - kp_prev2.get("landmark_13", {"y": 0})["y"]) / (4 * max_y),
+                wrist_dx,
+                (kp_next2.get("landmark_11", {"y": 0})["y"] - kp_prev2.get("landmark_11", {"y": 0})["y"]) / (4 * max_y),
+                abs(kp.get("landmark_11", {"y": 0})["y"] - kp.get("landmark_13", {"y": 0})["y"]) / max_y,
+                (elbow_angle_next2 - elbow_angle_prev2) / 4,
+                elbow_angle,
+                abs(kp.get("landmark_27", {"x": 0})["x"] - crease_x) / max_y  # Crease proximity
+            ]
+            X_frame.append(features)
+        predictions = frame_detector.model.predict(X_frame)
+        logging.info(f"Frame predictions: {predictions.tolist()}")
+        
+        frame_map = {1: "bfc_frame", 2: "ffc_frame", 3: "uah_frame", 4: "release_frame"}
+        detected_frames = {}
+        for stage in [1, 2, 3, 4]:
+            key = frame_map[stage]
+            candidates = [(i, p) for i, p in enumerate(predictions) if p == stage and
+                          (stage == 1 or detected_frames.get("bfc_frame", -1) < i) and
+                          (stage <= 2 or detected_frames.get("ffc_frame", -1) < i) and
+                          (stage <= 3 or detected_frames.get("uah_frame", -1) < i)]
+            if not candidates:
+                logging.warning(f"No valid {key} detected")
+                continue
+            if stage == 3:  # UAH: closest to 90°
+                frame_idx = min(candidates, key=lambda x: abs(elbow_angles[x[0]] - 90))[0]
+            elif stage == 4:  # Release: max wrist X post-UAH
+                frame_idx = max(candidates, key=lambda x: wrist_x[x[0]] if x[0] > detected_frames.get("uah_frame", -1) else -float('inf'))[0]
+            else:  # BFC/FFC: earliest valid near crease
+                frame_idx = min(candidates, key=lambda x: abs(full_keypoints[x[0]]["keypoints"].get("landmark_27", {"x": 0})["x"] - crease_x))[0]
+            detected_frames[key] = frame_idx
+            assessment[key] = frame_idx
+            logging.info(f"Set {key} to frame {frame_idx}")
+        
+        if len(detected_frames) < 4:
+            logging.warning(f"Could not detect all stages in order: {detected_frames}")
+    
+    if angle_adjuster and angle_adjuster.trained and "uah_frame" in assessment and "release_frame" in assessment:
+        for key in ["uah_frame", "release_frame"]:
+            frame_idx = assessment[key]
+            kp = full_keypoints[frame_idx]["keypoints"]
+            features = [kp.get(f"landmark_{j}", {"x": 0, "y": 0})[k] for j in range(33) for k in ["x", "y"]]
+            pred = angle_adjuster.model.predict([features[:66]])[0]
+            angle = calculate_angle(kp.get("landmark_11", {"x": 0, "y": 0}),
+                                  kp.get("landmark_13", {"x": 0, "y": 0}),
+                                  kp.get("landmark_15", {"x": 0, "y": 0}), pitch_angle)
+            logging.info(f"{key} keypoints: shoulder={kp.get('landmark_11')}, elbow={kp.get('landmark_13')}, wrist={kp.get('landmark_15')}, angle={angle}")
+            if key == "uah_frame":
+                assessment["uah_angle_keypoint"] = float(angle)
+            else:
+                assessment["release_angle_keypoint"] = float(angle)
+                assessment["elbow_extension_keypoint"] = float(abs(assessment["release_angle_keypoint"] - assessment["uah_angle_keypoint"]))
+                assessment["elbow_legality"] = "legal" if assessment["elbow_extension_keypoint"] <= 16.5 else "illegal"
+    
+    if stride_predictor and stride_predictor.trained and "bfc_frame" in assessment and "ffc_frame" in assessment:
+        bfc_kp = full_keypoints[assessment["bfc_frame"]]["keypoints"]
+        ffc_kp = full_keypoints[assessment["ffc_frame"]]["keypoints"]
+        features = ([bfc_kp.get(f"landmark_{i}", {"x": 0, "y": 0})[k] for i in range(33) for k in ["x", "y"]] + 
+                   [ffc_kp.get(f"landmark_{i}", {"x": 0, "y": 0})[k] for i in range(33) for k in ["x", "y"]])
+        assessment["stride_length"] = float(stride_predictor.model.predict([features[:132]])[0])
+        logging.info(f"Stride length predicted: {assessment['stride_length']}")
+    
+    if refiner and refiner.trained and "bfc_frame" in assessment and "ffc_frame" in assessment:
+        bfc_kp = full_keypoints[assessment["bfc_frame"]]["keypoints"]
+        ffc_kp = full_keypoints[assessment["ffc_frame"]]["keypoints"]
+        shoulder_angle = calculate_angle(ffc_kp.get("landmark_11", {"x": 0, "y": 0}),
+                                       ffc_kp.get("landmark_12", {"x": 0, "y": 0}),
+                                       {"x": (ffc_kp.get("landmark_23", {"x": 0})["x"] + ffc_kp.get("landmark_24", {"x": 0})["x"]) / 2,
+                                        "y": (ffc_kp.get("landmark_23", {"y": 0})["y"] + ffc_kp.get("landmark_24", {"y": 0})["y"]) / 2},
+                                       pitch_angle)
+        features = [
+            (bfc_kp.get("landmark_27", {"x": 0})["x"] - bfc_kp.get("landmark_28", {"x": 0})["x"]) / max_y,
+            (ffc_kp.get("landmark_27", {"x": 0})["x"] - ffc_kp.get("landmark_28", {"x": 0})["x"]) / max_y,
+            shoulder_angle,
+            abs(ffc_kp.get("landmark_11", {"x": 0})["x"] - ffc_kp.get("landmark_12", {"x": 0})["x"]) / max_y
+        ]
+        style_map = {0: "Front-on", 1: "Side-on", 2: "Mixed"}
+        assessment["alignment"] = style_map.get(int(refiner.model.predict([features])[0]), "Mixed")
+        logging.info(f"Alignment predicted: {assessment['alignment']}")
+    
+    logging.info(f"Analysis for {video_id}: {json.dumps(assessment, indent=2)}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: python analyze_video.py <video_path> <keypoints_dir> <output_dir> [action_type]")
+        sys.exit(1)
+    video_path = sys.argv[1]
+    keypoints_dir = sys.argv[2]
+    output_dir = sys.argv[3]
+    action_type = sys.argv[4] if len(sys.argv) > 4 else "fast"
+    analyze_video(video_path, keypoints_dir, output_dir, action_type)

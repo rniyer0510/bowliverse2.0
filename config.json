@@ -1,0 +1,15 @@
+{
+  "visibility_threshold": 0.6,
+  "wrist_visibility_threshold": 0.6,
+  "elbow_angle_min": 90,
+  "elbow_angle_max": 180,
+  "legality_max_extension": 15.0,
+  "frame_window_size": 3,
+  "uah_angle_threshold": 45,
+  "uah_elbow_height": -0.05,
+  "uah_velocity_spike": 5,
+  "uah_frame_window_min": 15,
+  "uah_frame_window_max": 30,
+  "uah_default_frame_offset": -20,
+  "alignment_visibility_threshold": 0.6
+}

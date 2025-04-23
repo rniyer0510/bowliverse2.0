@@ -1,0 +1,50 @@
+# /Users/rniyer/bowliverse_ai/core/pitch_calibrator.py
+import cv2
+import numpy as np
+import json
+import os
+import logging
+from core.biomechanics import apply_biomechanics_rules
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def detect_crease(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=50, maxLineGap=10)
+    if lines is not None and len(lines) > 0:
+        for x1, y1, x2, y2 in lines[0]:
+            left = {"x": x1 / frame.shape[1], "y": y1 / frame.shape[0]}
+            right = {"x": x2 / frame.shape[1], "y": y2 / frame.shape[0]}
+            if abs(right["x"] - left["x"]) > 0.01:  # Ensure non-zero width
+                return left, right
+    logging.warning("No valid crease detected, using fallback")
+    return {"x": 0.1, "y": 0.8}, {"x": 0.3, "y": 0.8}  # Fallback
+
+def extract_pitch_reference(video_path, keypoints_json, output_json, action_type="fast"):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logging.error(f"Could not open {video_path}")
+        return
+    with open(keypoints_json, 'r') as f:
+        keypoints = json.load(f)
+    initial_assessment = apply_biomechanics_rules(keypoints, {"video_id": os.path.basename(video_path).split('.')[0]})
+    ffc_frame = initial_assessment.get("ffc_frame", 0)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, ffc_frame)
+    ret, frame = cap.read()
+    if not ret:
+        logging.warning(f"No frame at {ffc_frame} for {video_path}")
+        return
+    crease_left, crease_right = detect_crease(frame)
+    width = abs(crease_right["x"] - crease_left["x"])
+    pitch_angle = np.degrees(np.arctan2(crease_right["y"] - crease_left["y"], width if width > 0 else 0.01))
+    scale_factor = 1.22 / (width if width > 0 else 0.01)  # Fallback to avoid divide by zero
+    pitch_data = {
+        "crease_front": {"left": crease_left, "right": crease_right},
+        "pitch_angle": float(pitch_angle),
+        "scale_factor": float(min(scale_factor, 0.1))  # Cap at reasonable max
+    }
+    with open(output_json, 'w') as f:
+        json.dump(pitch_data, f)
+    logging.info(f"Extracted pitch reference for {video_path}")
+    cap.release()
