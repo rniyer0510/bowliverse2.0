@@ -18,7 +18,7 @@ def process_videos(video_dir, action_type="fast"):
     for filename in os.listdir(video_dir):
         if filename.startswith(f"{action_type}_") and filename.endswith(".mp4"):
             video_id = filename[len(action_type)+1:-4]
-            video_path = os.path.join(video_dir, filename)
+            video_path = os.path.join(output_dir, filename)
             keypoints_json = os.path.join(output_dir, f"bowling_analysis_{video_id}.json")
             pitch_json = os.path.join(output_dir, f"pitch_reference_{video_id}.json")
             logging.info(f"Processing {video_id} with utils.keypoints_utils2")
