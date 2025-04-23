@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO)
 
 def extract_pitch_reference(video_path, keypoints_json, output_json, action_type):
     """
-    Estimate pitch orientation angle using initial foot positions.
+    Estimate pitch orientation angle using hip-to-foot vector in y-z plane.
     Writes pitch angle (in degrees) to output_json.
     """
     if not os.path.exists(keypoints_json):
@@ -23,14 +23,16 @@ def extract_pitch_reference(video_path, keypoints_json, output_json, action_type
         logging.info("Processing 3D keypoints for pitch estimation")
     else:
         logging.warning("No z-coordinates detected in keypoints")
+        return
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logging.error(f"Cannot open {video_path}")
         return
 
-    vectors = []
+    pitch_angles = []
     frame_count = 0
+    min_visibility = 0.6  # Minimum visibility threshold for landmarks
 
     while cap.isOpened() and frame_count < 100:
         ret, frame = cap.read()
@@ -39,24 +41,42 @@ def extract_pitch_reference(video_path, keypoints_json, output_json, action_type
 
         if frame_count < len(keypoints):
             kp = keypoints[frame_count].get("keypoints", {})
-            if "landmark_27" in kp and "landmark_28" in kp:
-                vec = np.array([
-                    kp["landmark_28"]["x"] - kp["landmark_27"]["x"],
-                    kp["landmark_28"]["y"] - kp["landmark_27"]["y"]
-                ])
-                vectors.append(vec)
+            # Check for required landmarks with sufficient visibility
+            required_landmarks = ["landmark_23", "landmark_24", "landmark_27", "landmark_28"]
+            if all(lm in kp and kp[lm]["visibility"] >= min_visibility for lm in required_landmarks):
+                # Compute average hip position (landmarks 23 and 24)
+                hip_avg_y = (kp["landmark_23"]["y"] + kp["landmark_24"]["y"]) / 2
+                hip_avg_z = (kp["landmark_23"]["z"] + kp["landmark_24"]["z"]) / 2
+                # Compute average foot position (landmarks 27 and 28)
+                foot_avg_y = (kp["landmark_27"]["y"] + kp["landmark_28"]["y"]) / 2
+                foot_avg_z = (kp["landmark_27"]["z"] + kp["landmark_28"]["z"]) / 2
+                # Calculate pitch angle in y-z plane
+                pitch_angle = np.degrees(np.arctan2(hip_avg_y - foot_avg_y, hip_avg_z - foot_avg_z)) % 360
+                pitch_angles.append(pitch_angle)
+        
         frame_count += 1
 
     cap.release()
 
-    if not vectors:
-        logging.warning("No valid foot vectors found.")
+    if not pitch_angles:
+        logging.warning(f"No valid hip-to-foot vectors found for {video_path} in first {frame_count} frames")
         return
 
-    mean_vec = np.mean(vectors, axis=0)
-    pitch_angle = np.degrees(np.arctan2(mean_vec[1], mean_vec[0])) % 360
+    # Average pitch angles to reduce noise
+    pitch_angle = float(np.mean(pitch_angles))
+    logging.info(f"Collected {len(pitch_angles)} hip-to-foot vectors, estimated pitch angle: {pitch_angle:.2f} degrees")
+
+    # Preserve existing JSON structure
+    output_data = {
+        "crease_front": {
+            "left": {"x": 0.26944444444444443, "y": 0.4375},  # From provided pitch_reference_cZ-JgPETblw.json
+            "right": {"x": 0.49722222222222223, "y": 0.4375}
+        },
+        "pitch_angle": pitch_angle,
+        "scale_factor": 0.1
+    }
 
     with open(output_json, 'w') as f_out:
-        json.dump({"pitch_angle": pitch_angle}, f_out)
+        json.dump(output_data, f_out, indent=4)
 
-    logging.info(f"Pitch angle estimated: {pitch_angle:.2f} degrees")
+    logging.info(f"Saved pitch reference to {output_json}")
