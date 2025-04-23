@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 import json
@@ -18,6 +17,12 @@ def extract_pitch_reference(video_path, keypoints_json, output_json, action_type
 
     with open(keypoints_json, 'r') as f:
         keypoints = json.load(f)
+
+    # Validate 3D keypoints
+    if keypoints and any("z" in lm for frame in keypoints for lm in frame.get("keypoints", {}).values()):
+        logging.info("Processing 3D keypoints for pitch estimation")
+    else:
+        logging.warning("No z-coordinates detected in keypoints")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

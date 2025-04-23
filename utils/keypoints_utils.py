@@ -1,87 +1,106 @@
-import mediapipe as mp
 import cv2
-import json
+import mediapipe as mp
 import numpy as np
 import logging
-import os
-
-mp_pose = mp.solutions.pose
 
 logging.basicConfig(level=logging.INFO)
 
-def extract_keypoints(video_path, output_json, pitch_json=None, config=None):
+def extract_keypoints(video_path, config=None):
     """
-    Extract MediaPipe keypoints, apply pitch correction, save to JSON.
+    Extract 3D keypoints from a video using MediaPipe Pose.
     Args:
         video_path: Path to video file.
-        output_json: Path to save keypoint JSON.
-        pitch_json: Path to pitch reference JSON.
-        config: Configuration parameters.
+        config: Configuration parameters (e.g., visibility threshold).
     Returns:
-        List of keypoint frames.
+        List of keypoint dictionaries per frame with 3D coordinates.
     """
+    # Check MediaPipe version
+    import mediapipe
+    if mediapipe.__version__ < '0.8.9':
+        logging.error("MediaPipe version >= 0.8.9 required for 3D pose estimation")
+        return []
+
     config = config or {}
-    min_detection_confidence = config.get("min_detection_confidence", 0.6)
-    min_tracking_confidence = config.get("min_tracking_confidence", 0.6)
-    
+    mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence
+        static_image_mode=False,
+        model_complexity=2,  # Enable 3D pose estimation
+        min_detection_confidence=0.6,  # Harmonized with keypoints_utils2.py
+        min_tracking_confidence=0.6,   # Harmonized with keypoints_utils2.py
+        smooth_landmarks=True
     )
+    
     cap = cv2.VideoCapture(video_path)
-    keypoints_full = []
+    if not cap.isOpened():
+        logging.error(f"Cannot open video {video_path}")
+        pose.close()
+        return []
+    
+    keypoints = []
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        if not results.pose_landmarks:
-            logging.warning(f"Frame {len(keypoints_full)}: No landmarks detected")
-            keypoints_full.append({})
-            continue
-        landmarks = {
-            f"landmark_{i}": {
-                "x": lm.x,
-                "y": lm.y,
-                "visibility": lm.visibility
-            } for i, lm in enumerate(results.pose_landmarks.landmark)
-        }
-        keypoints_full.append({"keypoints": landmarks})
-        for i in config.get("key_landmarks", [11, 13, 14, 27, 28, 29, 30, 31, 32]):
-            vis = landmarks.get(f"landmark_{i}", {}).get("visibility", 0)
-            logging.info(f"Frame {len(keypoints_full)-1}: landmark_{i}_vis={vis:.2f}")
+        
+        # Convert to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(frame_rgb)
+        
+        frame_keypoints = {"keypoints": {}}
+        if results.pose_landmarks:
+            for i, lm in enumerate(results.pose_landmarks.landmark):
+                frame_keypoints["keypoints"][f"landmark_{i}"] = {
+                    "x": float(lm.x),
+                    "y": float(lm.y),
+                    "z": float(lm.z),  # Include z-coordinate
+                    "visibility": float(lm.visibility)
+                }
+            logging.info(f"Frame {len(keypoints)}: Extracted 3D keypoints for {len(frame_keypoints['keypoints'])} landmarks")
+        else:
+            logging.warning(f"Frame {len(keypoints)}: No landmarks detected")
+            frame_keypoints["keypoints"] = {}
+        
+        keypoints.append(frame_keypoints)
     
     cap.release()
     pose.close()
     
-    if pitch_json and os.path.exists(pitch_json):
-        with open(pitch_json, 'r') as f:
-            pitch_data = json.load(f)
-            pitch_angle = pitch_data.get("pitch_angle", 0)
-            if pitch_angle == 0:
-                logging.warning(f"Zero pitch angle in {pitch_json}")
-            else:
-                logging.info(f"Applying pitch correction: {pitch_angle:.2f} degrees")
-                for kp in keypoints_full:
-                    if "keypoints" in kp:
-                        adjust_keypoints(kp["keypoints"], pitch_angle, config)
-    
-    with open(output_json, 'w') as f:
-        json.dump(keypoints_full, f)
-    
-    return keypoints_full
+    logging.info(f"Extracted {len(keypoints)} frames of 3D keypoints from {video_path}")
+    return keypoints
 
-def adjust_keypoints(keypoints, pitch_angle, config=None):
+def adjust_keypoints(keypoints, pitch_angle):
     """
-    Rotate keypoints by pitch_angle (degrees, converted to radians).
+    Adjust 3D keypoints for pitch angle.
     Args:
-        keypoints: Dict of keypoints.
+        keypoints: Dict of landmarks with x, y, z, visibility.
         pitch_angle: Angle in degrees.
-        config: Configuration parameters.
+    Returns:
+        Adjusted keypoints dict.
     """
-    config = config or {}
-    for lm in keypoints.values():
-        x, y = lm["x"], lm["y"]
-        lm["x"] = x * np.cos(np.radians(pitch_angle)) + y * np.sin(np.radians(pitch_angle))
-        lm["y"] = -x * np.sin(np.radians(pitch_angle)) + y * np.cos(np.radians(pitch_angle))
+    if not keypoints:
+        logging.warning("No keypoints to adjust")
+        return keypoints
+    
+    adjusted = {}
+    try:
+        angle_rad = np.radians(pitch_angle)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+        for lm, data in keypoints.items():
+            x, y, z = data.get("x", 0), data.get("y", 0), data.get("z", 0)
+            visibility = data.get("visibility", 0)
+            # Rotate x, y; z remains unchanged
+            x_new = x * cos_a + y * sin_a
+            y_new = -x * sin_a + y * cos_a
+            z_new = z
+            adjusted[lm] = {
+                "x": float(x_new),
+                "y": float(y_new),
+                "z": float(z_new),
+                "visibility": visibility
+            }
+        return adjusted
+    except Exception as e:
+        logging.error(f"Failed to adjust keypoints: {e}")
+        return keypoints
